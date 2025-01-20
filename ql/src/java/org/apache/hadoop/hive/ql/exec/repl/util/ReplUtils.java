@@ -17,12 +17,17 @@
  */
 package org.apache.hadoop.hive.ql.exec.repl.util;
 
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonSerializer;
+import com.fasterxml.jackson.databind.SerializerProvider;
+
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.PathFilter;
 import org.apache.hadoop.hdfs.protocol.SnapshotException;
 import org.apache.hadoop.hive.common.TableName;
+import org.apache.hadoop.hive.common.ValidTxnList;
 import org.apache.hadoop.hive.common.repl.ReplConst;
 import org.apache.hadoop.hive.common.repl.ReplScope;
 import org.apache.hadoop.hive.conf.HiveConf;
@@ -31,9 +36,17 @@ import org.apache.hadoop.hive.metastore.api.ColumnStatistics;
 import org.apache.hadoop.hive.metastore.api.Database;
 import org.apache.hadoop.hive.metastore.api.EnvironmentContext;
 import org.apache.hadoop.hive.metastore.api.InvalidOperationException;
+import org.apache.hadoop.hive.metastore.api.ShowLocksResponse;
+import org.apache.hadoop.hive.metastore.api.ShowLocksRequest;
+import org.apache.hadoop.hive.metastore.api.ShowLocksResponseElement;
+import org.apache.hadoop.hive.metastore.api.NotificationEvent;
+import org.apache.hadoop.hive.metastore.messaging.MessageDeserializer;
+import org.apache.hadoop.hive.metastore.messaging.MessageFactory;
 import org.apache.hadoop.hive.metastore.utils.StringUtils;
 import org.apache.hadoop.hive.ql.ErrorMsg;
 import org.apache.hadoop.hive.ql.ddl.DDLWork;
+import org.apache.hadoop.hive.ql.ddl.DDLOperation;
+import org.apache.hadoop.hive.ql.ddl.table.create.CreateTableOperation;
 import org.apache.hadoop.hive.ql.ddl.table.misc.properties.AlterTableSetPropertiesDesc;
 import org.apache.hadoop.hive.ql.ddl.table.partition.PartitionUtils;
 import org.apache.hadoop.hive.ql.exec.Task;
@@ -42,6 +55,10 @@ import org.apache.hadoop.hive.ql.exec.repl.ReplAck;
 import org.apache.hadoop.hive.ql.exec.repl.ReplStateLogWork;
 import org.apache.hadoop.hive.ql.exec.util.DAGTraversal;
 import org.apache.hadoop.hive.ql.exec.util.Retryable;
+import org.apache.hadoop.hive.ql.lockmgr.DbLockManager;
+import org.apache.hadoop.hive.ql.lockmgr.HiveLockManager;
+import org.apache.hadoop.hive.ql.lockmgr.HiveTxnManager;
+import org.apache.hadoop.hive.ql.lockmgr.LockException;
 import org.apache.hadoop.hive.ql.metadata.Hive;
 import org.apache.hadoop.hive.ql.metadata.HiveException;
 import org.apache.hadoop.hive.ql.metadata.Table;
@@ -54,6 +71,7 @@ import org.apache.hadoop.hive.ql.parse.repl.dump.metric.IncrementalDumpMetricCol
 import org.apache.hadoop.hive.ql.parse.repl.load.metric.BootstrapLoadMetricCollector;
 import org.apache.hadoop.hive.ql.parse.repl.load.metric.IncrementalLoadMetricCollector;
 import org.apache.hadoop.hive.ql.parse.repl.metric.ReplicationMetricCollector;
+import org.apache.hadoop.hive.ql.parse.repl.metric.event.Metadata;
 import org.apache.hadoop.hive.ql.parse.repl.metric.event.Status;
 import org.apache.hadoop.hive.ql.plan.ColumnStatsUpdateWork;
 import org.apache.hadoop.hive.ql.plan.ExprNodeColumnDesc;
@@ -71,6 +89,7 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -78,6 +97,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Base64;
+import java.util.Set;
 
 import static org.apache.hadoop.hive.conf.Constants.SCHEDULED_QUERY_EXECUTIONID;
 import static org.apache.hadoop.hive.conf.Constants.SCHEDULED_QUERY_SCHEDULENAME;
@@ -141,6 +161,8 @@ public class ReplUtils {
 
   // Service name for atlas.
   public static final String REPL_ATLAS_SERVICE = "atlas";
+  public static final String INC_EVENTS_BATCH = "events_batch_%d";
+
   /**
    * Bootstrap REPL LOAD operation type on the examined object based on ckpt state.
    */
@@ -330,6 +352,14 @@ public class ReplUtils {
     return errorCode;
   }
 
+  public static boolean shouldIgnoreOnError(DDLOperation<?> ddlOperation, Throwable e) {
+    return ReplUtils.isCreateOperation(ddlOperation) && e.getMessage().contains("java.lang.NumberFormatException");
+  }
+
+  public static boolean isCreateOperation(DDLOperation<?> ddlOperation) {
+    return ddlOperation instanceof CreateTableOperation;
+  }
+
   private static String getMetricStageName(String stageName, ReplicationMetricCollector metricCollector) {
     if( stageName == "REPL_DUMP" || stageName == "REPL_LOAD" || stageName == "ATLAS_DUMP" || stageName == "ATLAS_LOAD"
             || stageName == "RANGER_DUMP" || stageName == "RANGER_LOAD" || stageName == "RANGER_DENY"){
@@ -356,6 +386,55 @@ public class ReplUtils {
     // If flag is not set, then we assume first incremental load is done as the database/table may be created by user
     // and not through replication.
     return parameters != null && ReplConst.TRUE.equalsIgnoreCase(parameters.get(ReplConst.REPL_FIRST_INC_PENDING_FLAG));
+  }
+
+  public static List<Long> getOpenTxns(ValidTxnList validTxnList) {
+    long[] invalidTxns = validTxnList.getInvalidTransactions();
+    List<Long> openTxns = new ArrayList<>();
+    for (long invalidTxn : invalidTxns) {
+      if (!validTxnList.isTxnAborted(invalidTxn)) {
+        openTxns.add(invalidTxn);
+      }
+    }
+    return openTxns;
+  }
+
+  public static List<Long> getOpenTxns(HiveTxnManager hiveTxnManager, ValidTxnList validTxnList, String dbName) throws LockException {
+    HiveLockManager lockManager = hiveTxnManager.getLockManager();
+    long[] invalidTxns = validTxnList.getInvalidTransactions();
+    List<Long> openTxns = new ArrayList<>();
+    Set<Long> dbTxns = new HashSet<>();
+    if (lockManager instanceof DbLockManager) {
+      ShowLocksRequest request = new ShowLocksRequest();
+      request.setDbname(dbName.toLowerCase());
+      ShowLocksResponse showLocksResponse = ((DbLockManager)lockManager).getLocks(request);
+      for (ShowLocksResponseElement showLocksResponseElement : showLocksResponse.getLocks()) {
+        dbTxns.add(showLocksResponseElement.getTxnid());
+      }
+      for (long invalidTxn : invalidTxns) {
+        if (dbTxns.contains(invalidTxn) && !validTxnList.isTxnAborted(invalidTxn)) {
+          openTxns.add(invalidTxn);
+        }
+      }
+    } else {
+      for (long invalidTxn : invalidTxns) {
+        if (!validTxnList.isTxnAborted(invalidTxn)) {
+          openTxns.add(invalidTxn);
+        }
+      }
+    }
+    return openTxns;
+  }
+
+  public static MessageDeserializer getEventDeserializer(NotificationEvent event) {
+    try {
+      return MessageFactory.getInstance(event.getMessageFormat()).getDeserializer();
+    } catch (Exception e) {
+      String message =
+              "could not create appropriate messageFactory for format " + event.getMessageFormat();
+      LOG.error(message, e);
+      throw new IllegalStateException(message, e);
+    }
   }
 
   public static EnvironmentContext setReplDataLocationChangedFlag(EnvironmentContext envContext) {
@@ -400,7 +479,7 @@ public class ReplUtils {
   }
 
   public static Path getEncodedDumpRootPath(HiveConf conf, String dbname) throws UnsupportedEncodingException {
-    return new Path(conf.getVar(HiveConf.ConfVars.REPLDIR),
+    return new Path(conf.getVar(HiveConf.ConfVars.REPL_DIR),
       Base64.getEncoder().encodeToString(dbname
         .getBytes(StandardCharsets.UTF_8.name())));
   }
@@ -466,11 +545,20 @@ public class ReplUtils {
     }
   }
 
+  /**
+   * Used to report status of replication stage which is skipped or has some error
+   * @param stageName Name of replication stage
+   * @param status Status skipped or FAILED etc
+   * @param errorLogPath path of error log file
+   * @param conf handle configuration parameter
+   * @param dbName name of database
+   * @param replicationType type of replication incremental, bootstrap, etc
+   * @throws SemanticException
+   */
   public static void reportStatusInReplicationMetrics(String stageName, Status status, String errorLogPath,
-                                                      HiveConf conf)
+                                                      HiveConf conf, String dbName, Metadata.ReplicationType replicationType)
           throws SemanticException {
-    ReplicationMetricCollector metricCollector =
-            new ReplicationMetricCollector(null, null, null, 0, conf) {};
+    ReplicationMetricCollector metricCollector = new ReplicationMetricCollector(dbName, replicationType, null, 0, conf) {};
     metricCollector.reportStageStart(stageName, new HashMap<>());
     metricCollector.reportStageEnd(stageName, status, errorLogPath);
   }
@@ -478,5 +566,17 @@ public class ReplUtils {
   public static boolean isErrorRecoverable(Throwable e) {
     int errorCode = ErrorMsg.getErrorMsg(e.getMessage()).getErrorCode();
     return errorCode > ErrorMsg.GENERIC_ERROR.getErrorCode();
+  }
+
+  // True if REPL DUMP should do transaction optimization
+  public static boolean filterTransactionOperations(HiveConf conf) {
+    return (conf.getBoolVar(HiveConf.ConfVars.REPL_FILTER_TRANSACTIONS));
+  }
+  public  static class TimeSerializer extends JsonSerializer<Long> {
+
+    @Override
+    public void serialize(Long epoch, JsonGenerator jsonGenerator, SerializerProvider serializerProvider) throws IOException {
+      jsonGenerator.writeString(Instant.ofEpochSecond(epoch).toString());
+    }
   }
 }

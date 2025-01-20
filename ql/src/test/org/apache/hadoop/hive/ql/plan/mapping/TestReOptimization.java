@@ -294,6 +294,7 @@ public class TestReOptimization {
 
     conf.setBoolVar(ConfVars.HIVE_QUERY_REEXECUTION_ENABLED, true);
     conf.setBoolVar(ConfVars.HIVE_VECTORIZATION_ENABLED, false);
+    conf.setVar(ConfVars.HIVE_CBO_FALLBACK_STRATEGY, "NEVER");
     conf.setVar(ConfVars.HIVE_QUERY_REEXECUTION_STRATEGIES, strategies);
     conf.setBoolVar(ConfVars.HIVE_EXPLAIN_USER, true);
     conf.set("zzz", "1");
@@ -302,7 +303,7 @@ public class TestReOptimization {
     conf.setVar(HiveConf.ConfVars.HIVE_AUTHORIZATION_MANAGER,
         "org.apache.hadoop.hive.ql.security.authorization.plugin.sqlstd.SQLStdHiveAuthorizerFactory");
     HiveConf.setBoolVar(conf, HiveConf.ConfVars.HIVE_SUPPORT_CONCURRENCY, false);
-    HiveConf.setVar(conf, HiveConf.ConfVars.POSTEXECHOOKS, OperatorStatsReaderHook.class.getName());
+    HiveConf.setVar(conf, HiveConf.ConfVars.POST_EXEC_HOOKS, OperatorStatsReaderHook.class.getName());
     SessionState.start(conf);
 
     IDriver driver = DriverFactory.newDriver(conf);

@@ -512,9 +512,9 @@ import com.google.common.annotations.VisibleForTesting;
       typeName = VectorizationContext.mapTypeNameSynonyms(typeName);
 
       // Make CHAR and VARCHAR type info parsable.
-      if (typeName.equals("char")) {
+      if (typeName.equals(serdeConstants.CHAR_TYPE_NAME)) {
         typeName = "char(" + HiveChar.MAX_CHAR_LENGTH + ")";
-      } else if (typeName.equals("varchar")) {
+      } else if (typeName.equals(serdeConstants.VARCHAR_TYPE_NAME)) {
         typeName = "varchar(" + HiveVarchar.MAX_VARCHAR_LENGTH + ")";
       }
 
@@ -644,7 +644,9 @@ import com.google.common.annotations.VisibleForTesting;
     udfsNeedingImplicitDecimalCast.add(UDFLog2.class);
     udfsNeedingImplicitDecimalCast.add(UDFSin.class);
     udfsNeedingImplicitDecimalCast.add(UDFAsin.class);
+    udfsNeedingImplicitDecimalCast.add(UDFSinh.class);
     udfsNeedingImplicitDecimalCast.add(UDFCos.class);
+    udfsNeedingImplicitDecimalCast.add(UDFCosh.class);
     udfsNeedingImplicitDecimalCast.add(UDFAcos.class);
     udfsNeedingImplicitDecimalCast.add(UDFLog10.class);
     udfsNeedingImplicitDecimalCast.add(UDFLog.class);
@@ -653,6 +655,7 @@ import com.google.common.annotations.VisibleForTesting;
     udfsNeedingImplicitDecimalCast.add(UDFRadians.class);
     udfsNeedingImplicitDecimalCast.add(UDFAtan.class);
     udfsNeedingImplicitDecimalCast.add(UDFTan.class);
+    udfsNeedingImplicitDecimalCast.add(UDFTanh.class);
     udfsNeedingImplicitDecimalCast.add(UDFOPLongDivide.class);
   }
 
@@ -839,6 +842,20 @@ import com.google.common.annotations.VisibleForTesting;
       markedScratchColumns = Arrays.copyOf(scratchColumnTrackWasUsed, scratchColumnTrackWasUsed.length);
     }
 
+    public String toString() {
+      StringBuilder builder = new StringBuilder();
+      builder.append(String.format(
+          "OutputColumnManager: initialOutputCol: %d, outputColCount: %d, usedOutputColumns#: %d"
+              + ", reuseScratchColumns: %s, output cols:",
+          initialOutputCol, outputColCount, usedOutputColumns.size(), reuseScratchColumns));
+      for (int i = 0; i < outputColCount; i++) {
+        builder.append(String.format(
+            "\n%d (%d): used: %s, scratchVectorTypeName: %s" + ", physicalVariation: %s, trackWasUsed: %s", i,
+            i + initialOutputCol, usedOutputColumns.contains(i), scratchVectorTypeNames[i],
+            scratchDataTypePhysicalVariations[i], scratchColumnTrackWasUsed[i]));
+      }
+      return builder.toString();
+    }
   }
 
   public int allocateScratchColumn(TypeInfo typeInfo) throws HiveException {
@@ -1086,6 +1103,9 @@ import com.google.common.annotations.VisibleForTesting;
   private int getStructFieldIndex(ExprNodeFieldDesc exprNodeFieldDesc) throws HiveException {
     ExprNodeDesc structNodeDesc = exprNodeFieldDesc.getDesc();
     String fieldName = exprNodeFieldDesc.getFieldName();
+    if (exprNodeFieldDesc.getIsList()) {
+      throw new HiveException("Could not vectorize expression with a LIST type without an index");
+    }
     StructTypeInfo structTypeInfo = (StructTypeInfo) structNodeDesc.getTypeInfo();
     int index = 0;
     boolean isFieldExist = false;
@@ -1458,9 +1478,9 @@ import com.google.common.annotations.VisibleForTesting;
       if ((gudf instanceof GenericUDFToString
                    || gudf instanceof GenericUDFToChar
                    || gudf instanceof GenericUDFToVarchar) &&
-               (arg0Type(expr).equals("timestamp")
-                   || arg0Type(expr).equals("double")
-                   || arg0Type(expr).equals("float"))) {
+               (arg0Type(expr).equals(serdeConstants.TIMESTAMP_TYPE_NAME)
+                   || arg0Type(expr).equals(serdeConstants.DOUBLE_TYPE_NAME)
+                   || arg0Type(expr).equals(serdeConstants.FLOAT_TYPE_NAME))) {
       return true;
     } else if (gudf instanceof GenericUDFBetween && (mode == VectorExpressionDescriptor.Mode.PROJECTION)) {
       return true;
@@ -1606,7 +1626,7 @@ import com.google.common.annotations.VisibleForTesting;
     }
 
     // Boolean is special case.
-    if (typeName.equalsIgnoreCase("boolean")) {
+    if (typeName.equalsIgnoreCase(serdeConstants.BOOLEAN_TYPE_NAME)) {
       if (mode == VectorExpressionDescriptor.Mode.FILTER) {
         if ((Boolean) constantValue) {
           return new FilterConstantBooleanVectorExpression(1);
@@ -2407,7 +2427,7 @@ import com.google.common.annotations.VisibleForTesting;
     } else if (udf instanceof GenericUDFToString) {
       ve = getCastToString(childExpr, returnType);
     } else if (udf instanceof GenericUDFToDecimal) {
-      ve = getCastToDecimal(childExpr, returnType);
+      ve = getCastToDecimal(childExpr, mode, returnType);
     } else if (udf instanceof GenericUDFToChar) {
       ve = getCastToChar(childExpr, returnType);
     } else if (udf instanceof GenericUDFToVarchar) {
@@ -2461,7 +2481,9 @@ import com.google.common.annotations.VisibleForTesting;
       return;
     }
     for (VectorExpression v : vectorChildren) {
-      if (!(v instanceof IdentityExpression)) {
+      if (!(v instanceof IdentityExpression
+            // it's not safe to reuse ConstantVectorExpression's output as a scratch column, see HIVE-26408
+            || v instanceof ConstantVectorExpression)) {
         ocm.freeOutputColumn(v.getOutputColumnNum());
       }
     }
@@ -2818,6 +2840,9 @@ import com.google.common.annotations.VisibleForTesting;
   private VectorExpression getInExpression(List<ExprNodeDesc> childExpr,
       VectorExpressionDescriptor.Mode mode, TypeInfo returnType) throws HiveException {
     ExprNodeDesc colExpr = childExpr.get(0);
+    if (colExpr instanceof ExprNodeConstantDesc) {
+      return null;
+    }
     List<ExprNodeDesc> inChildren = childExpr.subList(1, childExpr.size());
 
     String colType = colExpr.getTypeString();
@@ -3226,14 +3251,14 @@ import com.google.common.annotations.VisibleForTesting;
          isFloatFamily(inputType) ||
          decimalTypePattern.matcher(inputType).matches() ||
          isStringFamily(inputType) ||
-         inputType.equals("timestamp")) {
+         inputType.equals(serdeConstants.TIMESTAMP_TYPE_NAME)) {
       return returnDecimalType;
     }
     return null;
   }
 
-  private VectorExpression getCastToDecimal(List<ExprNodeDesc> childExpr, TypeInfo returnType)
-      throws HiveException {
+  private VectorExpression getCastToDecimal(List<ExprNodeDesc> childExpr, VectorExpressionDescriptor.Mode mode,
+      TypeInfo returnType) throws HiveException {
     ExprNodeDesc child = childExpr.get(0);
     String inputType = childExpr.get(0).getTypeString();
     if (child instanceof ExprNodeConstantDesc) {
@@ -3267,10 +3292,10 @@ import com.google.common.annotations.VisibleForTesting;
       }
       return createVectorExpression(CastLongToDecimal.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("float")) {
+    } else if (inputType.equals(serdeConstants.FLOAT_TYPE_NAME)) {
       return createVectorExpression(CastFloatToDecimal.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("double")) {
+    } else if (inputType.equals(serdeConstants.DOUBLE_TYPE_NAME)) {
       return createVectorExpression(CastDoubleToDecimal.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
     } else if (decimalTypePattern.matcher(inputType).matches()) {
@@ -3278,7 +3303,18 @@ import com.google.common.annotations.VisibleForTesting;
         int colIndex = getInputColumnIndex((ExprNodeColumnDesc) child);
         DataTypePhysicalVariation dataTypePhysicalVariation = getDataTypePhysicalVariation(colIndex);
         if (dataTypePhysicalVariation == DataTypePhysicalVariation.DECIMAL_64) {
-
+          // try to scale up the expression so we can match the return type scale
+          if (tryDecimal64Cast && ((DecimalTypeInfo)returnType).precision() <= 18) {
+            List<ExprNodeDesc> children = new ArrayList<>();
+            int scaleDiff = ((DecimalTypeInfo)returnType).scale() - ((DecimalTypeInfo)childExpr.get(0).getTypeInfo()).scale();
+            ExprNodeDesc newConstant = new ExprNodeConstantDesc(new DecimalTypeInfo(scaleDiff, 0),
+                HiveDecimal.create(POWEROFTENTABLE[scaleDiff]));
+            children.add(child);
+            children.add(newConstant);
+            ExprNodeGenericFuncDesc newScaledExpr = new ExprNodeGenericFuncDesc(returnType,
+                new GenericUDFOPScaleUpDecimal64(), " ScaleUp ", children);
+            return getVectorExpression(newScaledExpr, mode);
+          }
           // Do Decimal64 conversion instead.
           return createDecimal64ToDecimalConversion(colIndex, returnType);
         } else {
@@ -3290,9 +3326,13 @@ import com.google.common.annotations.VisibleForTesting;
             returnType, DataTypePhysicalVariation.NONE);
       }
     } else if (isStringFamily(inputType)) {
+      DataTypePhysicalVariation dataTypePhysicalVariation =
+          tryDecimal64Cast && ((DecimalTypeInfo) returnType).precision() <= 18 ?
+              DataTypePhysicalVariation.DECIMAL_64 : 
+              DataTypePhysicalVariation.NONE;
       return createVectorExpression(CastStringToDecimal.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
-          returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("timestamp")) {
+          returnType, dataTypePhysicalVariation);
+    } else if (inputType.equals(serdeConstants.TIMESTAMP_TYPE_NAME)) {
       return createVectorExpression(CastTimestampToDecimal.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
     }
@@ -3316,17 +3356,17 @@ import com.google.common.annotations.VisibleForTesting;
           return null;
         }
     }
-    if (inputType.equals("boolean")) {
+    if (inputType.equals(serdeConstants.BOOLEAN_TYPE_NAME)) {
       // Boolean must come before the integer family. It's a special case.
       return createVectorExpression(CastBooleanToStringViaLongToString.class, childExpr,
           VectorExpressionDescriptor.Mode.PROJECTION, returnType, DataTypePhysicalVariation.NONE);
     } else if (isIntFamily(inputType)) {
       return createVectorExpression(CastLongToString.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("float")) {
+    } else if (inputType.equals(serdeConstants.FLOAT_TYPE_NAME)) {
       return createVectorExpression(CastFloatToString.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("double")) {
+    } else if (inputType.equals(serdeConstants.DOUBLE_TYPE_NAME)) {
       return createVectorExpression(CastDoubleToString.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
     } else if (isDecimalFamily(inputType)) {
@@ -3357,17 +3397,17 @@ import com.google.common.annotations.VisibleForTesting;
       // Family of related JIRAs: HIVE-7421, HIVE-7422, and HIVE-7424.
       return null;
     }
-    if (inputType.equals("boolean")) {
+    if (inputType.equals(serdeConstants.BOOLEAN_TYPE_NAME)) {
       // Boolean must come before the integer family. It's a special case.
       return createVectorExpression(CastBooleanToCharViaLongToChar.class, childExpr,
           VectorExpressionDescriptor.Mode.PROJECTION, returnType, DataTypePhysicalVariation.NONE);
     } else if (isIntFamily(inputType)) {
       return createVectorExpression(CastLongToChar.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("float")) {
+    } else if (inputType.equals(serdeConstants.FLOAT_TYPE_NAME)) {
       return createVectorExpression(CastFloatToChar.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("double")) {
+    } else if (inputType.equals(serdeConstants.DOUBLE_TYPE_NAME)) {
       return createVectorExpression(CastDoubleToChar.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
     } else if (isDecimalFamily(inputType)) {
@@ -3395,17 +3435,17 @@ import com.google.common.annotations.VisibleForTesting;
       // Family of related JIRAs: HIVE-7421, HIVE-7422, and HIVE-7424.
       return null;
     }
-    if (inputType.equals("boolean")) {
+    if (inputType.equals(serdeConstants.BOOLEAN_TYPE_NAME)) {
       // Boolean must come before the integer family. It's a special case.
       return createVectorExpression(CastBooleanToVarCharViaLongToVarChar.class, childExpr,
           VectorExpressionDescriptor.Mode.PROJECTION, returnType, DataTypePhysicalVariation.NONE);
     } else if (isIntFamily(inputType)) {
       return createVectorExpression(CastLongToVarChar.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("float")) {
+    } else if (inputType.equals(serdeConstants.FLOAT_TYPE_NAME)) {
       return createVectorExpression(CastFloatToVarChar.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
-    } else if (inputType.equals("double")) {
+    } else if (inputType.equals(serdeConstants.DOUBLE_TYPE_NAME)) {
       return createVectorExpression(CastDoubleToVarChar.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
     } else if (isDecimalFamily(inputType)) {
@@ -3433,7 +3473,7 @@ import com.google.common.annotations.VisibleForTesting;
       // Family of related JIRAs: HIVE-7421, HIVE-7422, and HIVE-7424.
       return null;
     }
-    if (inputType.equalsIgnoreCase("string") || varcharTypePattern.matcher(inputType).matches()) {
+    if (inputType.equalsIgnoreCase(serdeConstants.STRING_TYPE_NAME) || varcharTypePattern.matcher(inputType).matches()) {
 
       // STRING and VARCHAR types require no conversion, so use a no-op.
       return getIdentityExpression(childExpr);
@@ -3463,7 +3503,7 @@ import com.google.common.annotations.VisibleForTesting;
         return createVectorExpression(CastLongToDouble.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
             returnType, DataTypePhysicalVariation.NONE);
       }
-    } else if (inputType.equals("timestamp")) {
+    } else if (inputType.equals(serdeConstants.TIMESTAMP_TYPE_NAME)) {
       return createVectorExpression(CastTimestampToDouble.class, childExpr, VectorExpressionDescriptor.Mode.PROJECTION,
           returnType, DataTypePhysicalVariation.NONE);
     } else if (isFloatFamily(inputType)) {
@@ -3712,7 +3752,7 @@ import com.google.common.annotations.VisibleForTesting;
       } else {
         cl = FilterDoubleColumnNotBetween.class;
       }
-    } else if (colType.equals("string") && !notKeywordPresent) {
+    } else if (colType.equals(serdeConstants.STRING_TYPE_NAME) && !notKeywordPresent) {
       if (mode == VectorExpressionDescriptor.Mode.PROJECTION) {
         cl = StringColumnBetween.class;
       } else {
@@ -3720,7 +3760,7 @@ import com.google.common.annotations.VisibleForTesting;
             FilterStringColumnBetweenDynamicValue.class :
             FilterStringColumnBetween.class);
       }
-    } else if (colType.equals("string") && notKeywordPresent) {
+    } else if (colType.equals(serdeConstants.STRING_TYPE_NAME) && notKeywordPresent) {
       if (mode == VectorExpressionDescriptor.Mode.PROJECTION) {
         cl = StringColumnNotBetween.class;
       } else {
@@ -3754,7 +3794,7 @@ import com.google.common.annotations.VisibleForTesting;
       } else {
         cl = FilterCharColumnNotBetween.class;
       }
-    } else if (colType.equals("timestamp") && !notKeywordPresent) {
+    } else if (colType.equals(serdeConstants.TIMESTAMP_TYPE_NAME) && !notKeywordPresent) {
       if (mode == VectorExpressionDescriptor.Mode.PROJECTION) {
         cl = TimestampColumnBetween.class;
       } else {
@@ -3762,7 +3802,7 @@ import com.google.common.annotations.VisibleForTesting;
             FilterTimestampColumnBetweenDynamicValue.class :
             FilterTimestampColumnBetween.class);
       }
-    } else if (colType.equals("timestamp") && notKeywordPresent) {
+    } else if (colType.equals(serdeConstants.TIMESTAMP_TYPE_NAME) && notKeywordPresent) {
       if (mode == VectorExpressionDescriptor.Mode.PROJECTION) {
         cl = TimestampColumnNotBetween.class;
       } else {
@@ -4229,43 +4269,43 @@ import com.google.common.annotations.VisibleForTesting;
   }
 
   public static boolean isStringFamily(String resultType) {
-    return resultType.equalsIgnoreCase("string") || charVarcharTypePattern.matcher(resultType).matches() ||
+    return resultType.equalsIgnoreCase(serdeConstants.STRING_TYPE_NAME) || charVarcharTypePattern.matcher(resultType).matches() ||
            resultType.equalsIgnoreCase("string_family");
   }
 
   public static boolean isDatetimeFamily(String resultType) {
-    return resultType.equalsIgnoreCase("timestamp") || resultType.equalsIgnoreCase("date");
+    return resultType.equalsIgnoreCase(serdeConstants.TIMESTAMP_TYPE_NAME) || resultType.equalsIgnoreCase(serdeConstants.DATE_TYPE_NAME);
   }
 
   public static boolean isTimestampFamily(String resultType) {
-    return resultType.equalsIgnoreCase("timestamp");
+    return resultType.equalsIgnoreCase(serdeConstants.TIMESTAMP_TYPE_NAME);
   }
 
   public static boolean isDateFamily(String resultType) {
-    return resultType.equalsIgnoreCase("date");
+    return resultType.equalsIgnoreCase(serdeConstants.DATE_TYPE_NAME);
   }
 
   @SuppressWarnings("unused") public static boolean isIntervalYearMonthFamily(String resultType) {
-    return resultType.equalsIgnoreCase("interval_year_month");
+    return resultType.equalsIgnoreCase(serdeConstants.INTERVAL_YEAR_MONTH_TYPE_NAME);
   }
 
   @SuppressWarnings("unused") public static boolean isIntervalDayTimeFamily(String resultType) {
-    return resultType.equalsIgnoreCase("interval_day_time");
+    return resultType.equalsIgnoreCase(serdeConstants.INTERVAL_DAY_TIME_TYPE_NAME);
   }
 
   // return true if this is any kind of float
   public static boolean isFloatFamily(String resultType) {
-    return resultType.equalsIgnoreCase("double")
-        || resultType.equalsIgnoreCase("float");
+    return resultType.equalsIgnoreCase(serdeConstants.DOUBLE_TYPE_NAME)
+        || resultType.equalsIgnoreCase(serdeConstants.FLOAT_TYPE_NAME);
   }
 
   // Return true if this data type is handled in the output vector as an integer.
   public static boolean isIntFamily(String resultType) {
-    return resultType.equalsIgnoreCase("tinyint")
-        || resultType.equalsIgnoreCase("smallint")
-        || resultType.equalsIgnoreCase("int")
-        || resultType.equalsIgnoreCase("bigint")
-        || resultType.equalsIgnoreCase("boolean")
+    return resultType.equalsIgnoreCase(serdeConstants.TINYINT_TYPE_NAME)
+        || resultType.equalsIgnoreCase(serdeConstants.SMALLINT_TYPE_NAME)
+        || resultType.equalsIgnoreCase(serdeConstants.INT_TYPE_NAME)
+        || resultType.equalsIgnoreCase(serdeConstants.BIGINT_TYPE_NAME)
+        || resultType.equalsIgnoreCase(serdeConstants.BOOLEAN_TYPE_NAME)
         || resultType.equalsIgnoreCase("long");
   }
 
@@ -4282,7 +4322,7 @@ import com.google.common.annotations.VisibleForTesting;
       return ((HiveChar) constDesc.getValue()).getStrippedValue().getBytes(StandardCharsets.UTF_8);
     } else if (varcharTypePattern.matcher(typeString).matches()) {
       return ((HiveVarchar) constDesc.getValue()).getValue().getBytes(StandardCharsets.UTF_8);
-    } else if (typeString.equalsIgnoreCase("boolean")) {
+    } else if (typeString.equalsIgnoreCase(serdeConstants.BOOLEAN_TYPE_NAME)) {
       if (constDesc.getValue() == null) {
         return null;
       }else{
@@ -4458,9 +4498,9 @@ import com.google.common.annotations.VisibleForTesting;
     typeName = typeName.toLowerCase();
     switch (typeName) {
     case "long":
-      return "bigint";
+      return serdeConstants.BIGINT_TYPE_NAME;
     case "string_family":
-      return "string";
+      return serdeConstants.STRING_TYPE_NAME;
     default:
       return typeName;
     }
@@ -4545,10 +4585,10 @@ import com.google.common.annotations.VisibleForTesting;
       String typeName;
       if (vectorTypeName.equalsIgnoreCase("bytes")) {
         // Use hive type name.
-        typeName = "string";
+        typeName = serdeConstants.STRING_TYPE_NAME;
       } else if (vectorTypeName.equalsIgnoreCase("long")) {
         // Use hive type name.
-        typeName = "bigint";
+        typeName = serdeConstants.BIGINT_TYPE_NAME;
       } else {
         typeName = vectorTypeName;
       }

@@ -77,7 +77,7 @@ class CommitTxnHandler extends AbstractEventHandler<CommitTxnMessage> {
     }
 
     Path metaDataPath = new Path(withinContext.eventRoot, EximUtil.METADATA_NAME);
-    // In case of ACID operations, same directory may have many other sub directory for different write id stmt id
+    // In case of ACID operations, same directory may have many other subdirectory for different write id stmt id
     // combination. So we can not set isreplace to true.
     withinContext.replicationSpec.setIsReplace(false);
     EximUtil.createExportDump(metaDataPath.getFileSystem(withinContext.hiveConf), metaDataPath,
@@ -159,6 +159,13 @@ class CommitTxnHandler extends AbstractEventHandler<CommitTxnMessage> {
       List<WriteEventInfo> writeEventInfoList = null;
       if (replicatingAcidEvents) {
         writeEventInfoList = getAllWriteEventInfo(withinContext);
+
+        if (ReplUtils.filterTransactionOperations(withinContext.hiveConf)
+           && (writeEventInfoList == null || writeEventInfoList.size() == 0)) {
+          // If optimizing transactions, no need to dump this one
+          // if there were no write events.
+          return;
+        }
       }
 
       int numEntry = (writeEventInfoList != null ? writeEventInfoList.size() : 0);

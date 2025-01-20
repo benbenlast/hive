@@ -43,7 +43,7 @@ class HiveSchemaConverter {
   private static final Logger LOG = LoggerFactory.getLogger(HiveSchemaConverter.class);
 
   private int id;
-  private boolean autoConvert;
+  private final boolean autoConvert;
 
   private HiveSchemaConverter(boolean autoConvert) {
     this.autoConvert = autoConvert;
@@ -63,8 +63,10 @@ class HiveSchemaConverter {
 
   List<Types.NestedField> convertInternal(List<String> names, List<TypeInfo> typeInfos, List<String> comments) {
     List<Types.NestedField> result = Lists.newArrayListWithExpectedSize(names.size());
+    int outerId = id + names.size();
+    id = outerId;
     for (int i = 0; i < names.size(); ++i) {
-      result.add(Types.NestedField.optional(id++, names.get(i), convertType(typeInfos.get(i)),
+      result.add(Types.NestedField.optional(outerId - names.size() + i, names.get(i), convertType(typeInfos.get(i)),
           comments.isEmpty() || i >= comments.size() ? null : comments.get(i)));
     }
 
@@ -83,7 +85,7 @@ class HiveSchemaConverter {
             return Types.BooleanType.get();
           case BYTE:
           case SHORT:
-            Preconditions.checkArgument(autoConvert, "Unsupported Hive type: %s, use integer " +
+            Preconditions.checkArgument(autoConvert, "Unsupported Hive type %s, use integer " +
                     "instead or enable automatic type conversion, set 'iceberg.mr.schema.auto.conversion' to true",
                 ((PrimitiveTypeInfo) typeInfo).getPrimitiveCategory());
 
@@ -97,7 +99,7 @@ class HiveSchemaConverter {
             return Types.BinaryType.get();
           case CHAR:
           case VARCHAR:
-            Preconditions.checkArgument(autoConvert, "Unsupported Hive type: %s, use integer " +
+            Preconditions.checkArgument(autoConvert, "Unsupported Hive type %s, use string " +
                     "instead or enable automatic type conversion, set 'iceberg.mr.schema.auto.conversion' to true",
                 ((PrimitiveTypeInfo) typeInfo).getPrimitiveCategory());
 
@@ -131,15 +133,16 @@ class HiveSchemaConverter {
         return Types.StructType.of(fields);
       case MAP:
         MapTypeInfo mapTypeInfo = (MapTypeInfo) typeInfo;
-        Type keyType = convertType(mapTypeInfo.getMapKeyTypeInfo());
-        Type valueType = convertType(mapTypeInfo.getMapValueTypeInfo());
         int keyId = id++;
+        Type keyType = convertType(mapTypeInfo.getMapKeyTypeInfo());
         int valueId = id++;
+        Type valueType = convertType(mapTypeInfo.getMapValueTypeInfo());
         return Types.MapType.ofOptional(keyId, valueId, keyType, valueType);
       case LIST:
         ListTypeInfo listTypeInfo = (ListTypeInfo) typeInfo;
+        int listId = id++;
         Type listType = convertType(listTypeInfo.getListElementTypeInfo());
-        return Types.ListType.ofOptional(id++, listType);
+        return Types.ListType.ofOptional(listId, listType);
       case UNION:
       default:
         throw new IllegalArgumentException("Unknown type " + typeInfo.getCategory());
