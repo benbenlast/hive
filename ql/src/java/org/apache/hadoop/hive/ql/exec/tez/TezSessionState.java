@@ -27,6 +27,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
@@ -47,6 +48,7 @@ import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.hive.common.FileUtils;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.conf.HiveConfUtil;
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars;
@@ -92,6 +94,7 @@ import org.apache.hadoop.hive.ql.exec.tez.monitoring.TezJobMonitor;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.annotation.JsonSerialize;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 
@@ -281,7 +284,7 @@ public class TezSessionState {
     } else {
       this.resources = new HiveResources(createTezDir(sessionId, "resources"));
       ensureLocalResources(conf, additionalFilesNotFromConf);
-      LOG.info("Created new resources: " + resources);
+      LOG.info("Created new resources: " + this.resources);
     }
 
     // unless already installed on all the cluster nodes, we'll have to
@@ -361,7 +364,7 @@ public class TezSessionState {
      */
     HiveConfUtil.updateCredentialProviderPasswordForJobs(tezConfig);
 
-    String tezJobNameFormat = HiveConf.getVar(conf, ConfVars.HIVETEZJOBNAME);
+    String tezJobNameFormat = HiveConf.getVar(conf, ConfVars.HIVE_TEZ_JOB_NAME);
     final TezClient session = TezClient.newBuilder(String.format(tezJobNameFormat, sessionId), tezConfig)
         .setIsSession(true).setLocalResources(commonLocalResources)
         .setCredentials(llapCredentials).setServicePluginDescriptor(servicePluginsDescriptor)
@@ -488,7 +491,10 @@ public class TezSessionState {
       // Unset this after opening the session so that reopening of session uses the correct queue
       // names i.e, if client has not died and if the user has explicitly set a queue name
       // then reopened session will use user specified queue name else default cluster queue names.
-      conf.unset(TezConfiguration.TEZ_QUEUE_NAME);
+      if (conf.getBoolVar(ConfVars.HIVE_SERVER2_TEZ_INITIALIZE_DEFAULT_SESSIONS)) {
+        LOG.debug("Unsetting tez.queue.name (from: {})", conf.get(TezConfiguration.TEZ_QUEUE_NAME));
+        conf.unset(TezConfiguration.TEZ_QUEUE_NAME);
+      }
       return session;
     } finally {
       if (isOnThread && !isSuccessful) {
@@ -603,7 +609,7 @@ public class TezSessionState {
     String loginUser =
         loginUserUgi == null ? null : loginUserUgi.getShortUserName();
     boolean addHs2User =
-        HiveConf.getBoolVar(hiveConf, ConfVars.HIVETEZHS2USERACCESS);
+        HiveConf.getBoolVar(hiveConf, ConfVars.HIVE_TEZ_HS2_USER_ACCESS);
 
     String viewStr = Utilities.getAclStringWithHiveModification(tezConf,
             TezConfiguration.TEZ_AM_VIEW_ACLS, addHs2User, user, loginUser);
@@ -789,12 +795,12 @@ public class TezSessionState {
     // tez needs its own scratch dir (per session)
     // TODO: De-link from SessionState. A TezSession can be linked to different Hive Sessions via the pool.
     SessionState sessionState = SessionState.get();
-    String hdfsScratchDir = sessionState == null ? HiveConf.getVar(conf, HiveConf.ConfVars.SCRATCHDIR) : sessionState
+    String hdfsScratchDir = sessionState == null ? HiveConf.getVar(conf, HiveConf.ConfVars.SCRATCH_DIR) : sessionState
       .getHdfsScratchDirURIString();
     Path tezDir = new Path(hdfsScratchDir, TEZ_DIR);
     tezDir = new Path(tezDir, sessionId + ((suffix == null) ? "" : ("-" + suffix)));
     FileSystem fs = tezDir.getFileSystem(conf);
-    FsPermission fsPermission = new FsPermission(HiveConf.getVar(conf, HiveConf.ConfVars.SCRATCHDIRPERMISSION));
+    FsPermission fsPermission = new FsPermission(HiveConf.getVar(conf, HiveConf.ConfVars.SCRATCH_DIR_PERMISSION));
     fs.mkdirs(tezDir, fsPermission);
     // Make sure the path is normalized (we expect validation to pass since we just created it).
     tezDir = DagUtils.validateTargetDir(tezDir, conf).getPath();
@@ -812,7 +818,8 @@ public class TezSessionState {
    * @throws LoginException when we are unable to determine the user.
    * @throws URISyntaxException when current jar location cannot be determined.
    */
-  private LocalResource createJarLocalResource(String localJarPath)
+  @VisibleForTesting
+  LocalResource createJarLocalResource(String localJarPath)
       throws IOException, LoginException, IllegalArgumentException {
     // TODO Reduce the number of lookups that happen here. This shouldn't go to HDFS for each call.
     // The hiveJarDir can be determined once per client.
@@ -820,7 +827,7 @@ public class TezSessionState {
     assert destDirStatus != null;
     Path destDirPath = destDirStatus.getPath();
 
-    Path localFile = new Path(localJarPath);
+    Path localFile = FileUtils.resolveSymlinks(new Path(localJarPath), conf);
     String sha = getSha(localFile);
 
     String destFileName = localFile.getName();
@@ -1000,5 +1007,11 @@ public class TezSessionState {
     }
     this.resources = resources;
     return dir;
+  }
+
+  public String getAppMasterUri() {
+    return Optional.of(getSession()).map(
+            tezClient -> tezClient.getAmHost() + ":" + tezClient.getAmPort())
+        .get();
   }
 }

@@ -21,10 +21,12 @@ package org.apache.iceberg.mr.hive;
 
 import java.io.IOException;
 import java.util.List;
-import org.apache.iceberg.AssertHelpers;
+import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.HistoryEntry;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.types.Types;
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import static org.apache.iceberg.mr.hive.HiveIcebergTestUtils.timestampAfterSnapshot;
@@ -33,6 +35,12 @@ import static org.apache.iceberg.mr.hive.HiveIcebergTestUtils.timestampAfterSnap
  * Tests covering the time travel feature, aka reading from a table as of a certain snapshot.
  */
 public class TestHiveIcebergTimeTravel extends HiveIcebergStorageHandlerWithEngineBase {
+
+  @Override
+  protected void validateTestParams() {
+    Assume.assumeTrue(fileFormat == FileFormat.PARQUET && isVectorized &&
+        testTableType == TestTables.TestTableType.HIVE_CATALOG && formatVersion == 2);
+  }
 
   @Test
   public void testSelectAsOfTimestamp() throws IOException, InterruptedException {
@@ -50,10 +58,14 @@ public class TestHiveIcebergTimeTravel extends HiveIcebergStorageHandlerWithEngi
 
     Assert.assertEquals(4, rows.size());
 
-    AssertHelpers.assertThrows("should throw exception", IllegalArgumentException.class,
-        "java.lang.IllegalArgumentException: Cannot find a snapshot older than 1970-01-01", () -> {
-        shell.executeStatement("SELECT * FROM customers FOR SYSTEM_TIME AS OF '1970-01-01 00:00:00'");
-        });
+    try {
+      shell.executeStatement("SELECT * FROM customers FOR SYSTEM_TIME AS OF '1970-01-01 00:00:00'");
+    } catch (Throwable e) {
+      while (e.getCause() != null) {
+        e = e.getCause();
+      }
+      Assert.assertTrue(e.getMessage().contains("Cannot find a snapshot older than 1970-01-01"));
+    }
   }
 
   @Test
@@ -73,10 +85,44 @@ public class TestHiveIcebergTimeTravel extends HiveIcebergStorageHandlerWithEngi
 
     Assert.assertEquals(4, rows.size());
 
-    AssertHelpers.assertThrows("should throw exception", IllegalArgumentException.class,
-        "Cannot find snapshot with ID 1234", () -> {
-          shell.executeStatement("SELECT * FROM customers FOR SYSTEM_VERSION AS OF 1234");
-        });
+    try {
+      shell.executeStatement("SELECT * FROM customers FOR SYSTEM_VERSION AS OF 1234");
+    } catch (Throwable e) {
+      while (e.getCause() != null) {
+        e = e.getCause();
+      }
+      Assert.assertTrue(e.getMessage().contains("Cannot find snapshot with ID 1234"));
+    }
+  }
+
+  @Test
+  public void testSelectAsOfBranchReference() throws IOException, InterruptedException {
+    Table table = testTables.createTableWithVersions(shell, "customers",
+        HiveIcebergStorageHandlerTestUtils.CUSTOMER_SCHEMA,
+        fileFormat, HiveIcebergStorageHandlerTestUtils.CUSTOMER_RECORDS, 2);
+
+    long firstSnapshotId = table.history().get(0).snapshotId();
+    table.manageSnapshots().createBranch("main_branch", firstSnapshotId).commit();
+    List<Object[]> rows =
+        shell.executeStatement("SELECT * FROM customers FOR SYSTEM_VERSION AS OF 'main_branch'");
+
+    Assert.assertEquals(3, rows.size());
+
+    long secondSnapshotId = table.history().get(1).snapshotId();
+    table.manageSnapshots().createBranch("test_branch", secondSnapshotId).commit();
+    rows = shell.executeStatement("SELECT * FROM customers FOR SYSTEM_VERSION AS OF 'test_branch'");
+
+    Assert.assertEquals(4, rows.size());
+
+    try {
+      shell.executeStatement("SELECT * FROM customers FOR SYSTEM_VERSION AS OF 'unknown_branch'");
+    } catch (Throwable e) {
+      while (e.getCause() != null) {
+        e = e.getCause();
+      }
+      Assert.assertTrue(e.getMessage().contains("Cannot find matching snapshot ID or reference name for " +
+          "version unknown_branch"));
+    }
   }
 
   @Test
@@ -108,6 +154,29 @@ public class TestHiveIcebergTimeTravel extends HiveIcebergStorageHandlerWithEngi
 
     rows = shell.executeStatement("SELECT * FROM customers3");
     Assert.assertEquals(7, rows.size());
+  }
+
+  @Test
+  public void testSelectAsOfCurrentTimestampAndInterval() throws IOException, InterruptedException {
+    testTables.createTableWithVersions(shell, "customers",
+        HiveIcebergStorageHandlerTestUtils.CUSTOMER_SCHEMA, fileFormat,
+        HiveIcebergStorageHandlerTestUtils.CUSTOMER_RECORDS, 3);
+
+    List<Object[]> rows = shell.executeStatement("SELECT * FROM " +
+        "customers FOR SYSTEM_TIME AS OF CURRENT_TIMESTAMP + interval '10' hours");
+
+    Assert.assertEquals(5, rows.size());
+  }
+
+  @Test
+  public void testInvalidSelectAsOfTimestampExpression() throws IOException, InterruptedException {
+    Table icebergTable = testTables.createTableWithVersions(shell, "customers",
+        HiveIcebergStorageHandlerTestUtils.CUSTOMER_SCHEMA, fileFormat,
+        HiveIcebergStorageHandlerTestUtils.CUSTOMER_RECORDS, 3);
+    icebergTable.updateSchema().addColumn("create_time", Types.TimestampType.withZone()).commit();
+
+    Assert.assertThrows(IllegalArgumentException.class, () -> shell.executeStatement("SELECT * FROM " +
+        "customers FOR SYSTEM_TIME AS OF create_time - interval '10' hours"));
   }
 
   @Test

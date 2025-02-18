@@ -1,9 +1,9 @@
 /**
-   Licensed to the Apache Software Foundation (ASF) under one or more 
-   contributor license agreements.  See the NOTICE file distributed with 
+   Licensed to the Apache Software Foundation (ASF) under one or more
+   contributor license agreements.  See the NOTICE file distributed with
    this work for additional information regarding copyright ownership.
    The ASF licenses this file to You under the Apache License, Version 2.0
-   (the "License"); you may not use this file except in compliance with 
+   (the "License"); you may not use this file except in compliance with
    the License.  You may obtain a copy of the License at
 
        http://www.apache.org/licenses/LICENSE-2.0
@@ -43,12 +43,19 @@ catch (RecognitionException e) {
 }
 }
 
+likeTableOrFile
+    : (KW_LIKE KW_FILE) => KW_LIKE KW_FILE
+    | (KW_LIKE KW_FILE format=identifier uri=StringLiteral) -> ^(TOK_LIKEFILE $format $uri)
+    | (KW_LIKE likeName=tableName) -> ^(TOK_LIKETABLE $likeName)
+    ;
+
 //----------------------- Rules for parsing createtable -----------------------------
 createTableStatement
 @init { gParent.pushMsg("create table statement", state); }
 @after { gParent.popMsg(state); }
     : KW_CREATE (temp=KW_TEMPORARY)? (trans=KW_TRANSACTIONAL)? (ext=KW_EXTERNAL)? KW_TABLE ifNotExists? name=tableName
-      (  like=KW_LIKE likeName=tableName
+      (  likeTableOrFile
+         createTablePartitionSpec?
          tableRowFormat?
          tableFileFormat?
          tableLocation?
@@ -57,6 +64,7 @@ createTableStatement
          tableComment?
          createTablePartitionSpec?
          tableBuckets?
+         tableWriteLocallyOrdered?
          tableSkewed?
          tableRowFormat?
          tableFileFormat?
@@ -65,11 +73,12 @@ createTableStatement
          (KW_AS selectStatementWithCTE)?
       )
     -> ^(TOK_CREATETABLE $name $temp? $trans? $ext? ifNotExists?
-         ^(TOK_LIKETABLE $likeName?)
+         likeTableOrFile?
          columnNameTypeOrConstraintList?
          tableComment?
          createTablePartitionSpec?
          tableBuckets?
+         tableWriteLocallyOrdered?
          tableSkewed?
          tableRowFormat?
          tableFileFormat?
@@ -78,7 +87,7 @@ createTableStatement
          selectStatementWithCTE?
         )
     | KW_CREATE mgd=KW_MANAGED KW_TABLE ifNotExists? name=tableName
-      (  like=KW_LIKE likeName=tableName
+      (  likeTableOrFile
          tableRowFormat?
          tableFileFormat?
          tableLocation?
@@ -87,6 +96,7 @@ createTableStatement
          tableComment?
          createTablePartitionSpec?
          tableBuckets?
+         tableWriteLocallyOrdered?
          tableSkewed?
          tableRowFormat?
          tableFileFormat?
@@ -95,11 +105,12 @@ createTableStatement
          (KW_AS selectStatementWithCTE)?
       )
     -> ^(TOK_CREATETABLE $name $mgd ifNotExists?
-         ^(TOK_LIKETABLE $likeName?)
+         likeTableOrFile?
          columnNameTypeOrConstraintList?
          tableComment?
          createTablePartitionSpec?
          tableBuckets?
+         tableWriteLocallyOrdered?
          tableSkewed?
          tableRowFormat?
          tableFileFormat?
